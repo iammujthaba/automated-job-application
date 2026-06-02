@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+applied_jobs.txt
+failed_jobs.txt
+job_application.log
+profile.json
+credentials.json
+resume.pdf
+.env
+.env*
+.idea/
+.vscode/
+venv/
+.venv/
