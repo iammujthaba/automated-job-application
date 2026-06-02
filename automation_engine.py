@@ -278,39 +278,74 @@ class ATSAutomationEngine:
     def __init__(self, page: Page):
         self.page = page
 
+
+
     def identify_ats(self, url: str) -> str:
-        """Determines the ATS system based on the URL or DOM structure."""
-        url_lower = url.lower()
-        if "myworkdayjobs.com" in url_lower:
-            return "workday"
-        if "lever.co" in url_lower:
-            return "lever"
-        if "greenhouse.io" in url_lower:
-            return "greenhouse"
-            
+        """
+        Determines the ATS system based on the URL hostname only.
+
+        IMPORTANT: We intentionally do NOT search the full page body/content for
+        ATS keywords.  Full-page content scanning causes catastrophic false positives
+        because social-media pages, classified sites, and ad-supported pages routinely
+        embed Workday/Lever/Greenhouse script tags or tracking pixels even when the
+        page itself is not an ATS form at all (the Facebook/Eduport failure was caused
+        exactly by this).
+
+        Identification order:
+          1. Known unsupported domains → 'unsupported'
+          2. Exact ATS subdomain patterns in the URL → specific ATS name
+          3. Everything else → 'generic'
+        """
         try:
-            # Fallback checks inside the document content
-            content = self.page.content().lower()
-            if "workday" in content:
-                return "workday"
-            if "lever.co" in content:
-                return "lever"
-            if "greenhouse.io" in content:
-                return "greenhouse"
+            from urllib.parse import urlparse
+            hostname = urlparse(url).hostname or ""
         except Exception:
-            pass
-            
+            hostname = ""
+        hostname_lower = hostname.lower()
+        url_lower = url.lower()
+
+        # --- Step 1: Unsupported domain blocklist (sourced from config.py) ---
+        for domain in config.UNSUPPORTED_DOMAINS:
+            if hostname_lower == domain or hostname_lower.endswith("." + domain):
+                logger.info(f"Domain '{hostname}' is on the unsupported blocklist. Skipping.")
+                return "unsupported"
+
+        # --- Step 2: Known ATS platforms (URL-hostname checks only) ---
+        # Workday: subdomains of myworkdayjobs.com (e.g. company.myworkdayjobs.com)
+        if "myworkdayjobs.com" in hostname_lower:
+            return "workday"
+        # Lever: jobs.lever.co
+        if hostname_lower == "jobs.lever.co" or hostname_lower.endswith(".lever.co"):
+            return "lever"
+        # Greenhouse: boards.greenhouse.io or job-boards.greenhouse.io
+        if "greenhouse.io" in hostname_lower:
+            return "greenhouse"
+        # iCIMS
+        if "icims.com" in hostname_lower:
+            return "generic"  # Handled by generic fallback for now
+        # SmartRecruiters
+        if "smartrecruiters.com" in hostname_lower:
+            return "generic"
+
+        # --- Step 3: Default to generic ---
         return "generic"
 
     def apply(self, url: str):
         """Orchestrates the entire application flow for a single URL."""
+        # Identify ATS *before* navigating so unsupported sites are skipped cheaply.
+        ats = self.identify_ats(url)
+        logger.info(f"Identified ATS portal as: '{ats.upper()}' for URL: {url}")
+
+        if ats == "unsupported":
+            raise Exception(
+                f"URL belongs to an unsupported / non-ATS domain and was skipped. "
+                f"Site: {url}"
+            )
+
         logger.info(f"Navigating to job application page: {url}")
         self.page.goto(url)
         self.page.wait_for_load_state("load")
-        
-        ats = self.identify_ats(url)
-        logger.info(f"Identified ATS portal as: '{ats.upper()}'")
-        
+
         if ats == "workday":
             self.handle_workday(url)
         elif ats == "lever":
@@ -489,30 +524,80 @@ class ATSAutomationEngine:
             raise Exception("Submit button not found on Greenhouse form.")
 
     def handle_generic(self):
-        """Attempt generic form filling and submission."""
+        """
+        Attempt generic form filling and submission.
+
+        Submit-button detection uses a broad, prioritised list of selectors so that
+        portals with non-standard markup (JobResultHub, custom career pages, etc.)
+        are still handled correctly.
+        """
         logger.info("Attempting generic form filling...")
         self.page.wait_for_timeout(3000)
-        
+
         fill_form_with_learning_loop(self.page)
-        
-        # Try to find submit buttons
-        submit_selectors = [
+
+        # -----------------------------------------------------------------------
+        # Ordered list of submit-button selectors, from most-specific to broadest.
+        # Each entry is either a CSS selector string or a tuple (strategy, value)
+        # where strategy is 'role' (uses get_by_role) or 'text' (uses get_by_text).
+        # -----------------------------------------------------------------------
+        SUBMIT_SELECTORS = [
+            # --- Native HTML submit controls (highest confidence) ---
             "button[type='submit']",
             "input[type='submit']",
+
+            # --- Semantic role + common submit labels ---
+            ("role", "Submit"),
+            ("role", "Submit Application"),
+            ("role", "Apply Now"),
+            ("role", "Apply"),
+            ("role", "Send Application"),
+            ("role", "Post Application"),
+            ("role", "Complete Application"),
+            ("role", "Finish Application"),
+
+            # --- CSS :has-text matchers for <button> ---
+            "button:has-text('Submit Application')",
             "button:has-text('Submit')",
+            "button:has-text('Apply Now')",
             "button:has-text('Apply')",
-            "a:has-text('Submit Application')"
+            "button:has-text('Send Application')",
+            "button:has-text('Post Application')",
+            "button:has-text('Complete Application')",
+            "button:has-text('Finish')",
+            "button:has-text('Send')",
+
+            # --- <input type='button'> variants ---
+            "input[type='button'][value*='Submit' i]",
+            "input[type='button'][value*='Apply' i]",
+
+            # --- <a> tag submit-like links ---
+            "a:has-text('Submit Application')",
+            "a:has-text('Apply Now')",
+            "a:has-text('Submit')",
+            "a[role='button']:has-text('Apply')",
+
+            # --- aria-label fallback ---
+            "[aria-label*='submit' i]",
+            "[aria-label*='apply' i]",
         ]
-        
-        for selector in submit_selectors:
-            submit_btn = self.page.locator(selector).first
+
+        for selector in SUBMIT_SELECTORS:
             try:
-                if submit_btn.is_visible(timeout=500):
+                if isinstance(selector, tuple):
+                    # Use get_by_role for semantic role-based lookups
+                    _, label = selector
+                    submit_btn = self.page.get_by_role("button", name=label, exact=False).first
+                else:
+                    submit_btn = self.page.locator(selector).first
+
+                if submit_btn.is_visible(timeout=600):
+                    logger.info(f"Generic submit button found via selector: {selector!r}")
                     self.safe_submit(submit_btn)
                     return
             except Exception:
                 pass
-                
+
         raise Exception("Submit button could not be identified on generic portal.")
 
     def safe_submit(self, submit_button: Locator):
